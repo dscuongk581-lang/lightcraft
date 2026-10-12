@@ -1,0 +1,11 @@
+[Unit]
+Description=Run isolated LightCraft queue worker periodically
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+Unit=lightcraft-queue-worker.service
+
+[Install]
+WantedBy=timers.target
