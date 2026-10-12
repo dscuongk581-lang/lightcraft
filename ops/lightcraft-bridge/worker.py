@@ -203,23 +203,14 @@ def process_one():
             os.replace(partial, output)
             output_sha = hash_file(output)
             count = output.stat().st_size
-            c.execute("""UPDATE jobs SET state='DONE',result_path=?,result_sha=?,
+            # Rendering is NOT downstream delivery. Keep both temporary files until
+            # the authorized destination verifies storage and acknowledges checksum.
+            c.execute("""UPDATE jobs SET state='READY_FOR_DELIVERY',result_path=?,result_sha=?,
               result_bytes=?,result_width=?,result_height=?,updated=?,error=NULL WHERE id=?""",
               (str(output), output_sha, count, w, h, int(time.time()), jid))
             c.commit()
-            # Remove only the temporary original after validated output and durable DB update.
-            source_deleted = False
-            try:
-                input_path.unlink(missing_ok=True)
-                source_deleted = True
-                c.execute("UPDATE jobs SET source_deleted=1,updated=? WHERE id=?",
-                          (int(time.time()), jid))
-                c.commit()
-            except OSError:
-                # Output stays DONE; retention cleanup can delete remaining temp source.
-                pass
-            return {"id": jid, "state": "DONE", "width": w, "height": h,
-                    "bytes": count, "source_deleted": source_deleted}
+            return {"id": jid, "state": "READY_FOR_DELIVERY", "width": w,
+                    "height": h, "bytes": count, "source_deleted": False}
         except (Exception,) as e:
             # A timed-out Docker CLI can leave its container behind; force cleanup.
             try:
@@ -235,6 +226,49 @@ def process_one():
                       ("QUEUED" if retryable else "FAILED", code, int(time.time()), jid))
             c.commit()
             return {"id": jid, "state": "QUEUED" if retryable else "FAILED", "error": code}
+    finally:
+        c.close()
+
+
+def acknowledge(tenant, jid, confirmed_sha):
+    """Trusted internal operator only: call after durable tenant-library upload is verified."""
+    if not SLUG_RE.fullmatch(tenant):
+        raise ValueError("invalid tenant")
+    uuid.UUID(jid)
+    if not re.fullmatch(r"[0-9a-f]{64}", confirmed_sha):
+        raise ValueError("invalid checksum")
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT * FROM jobs WHERE tenant=? AND id=?", (tenant, jid)).fetchone()
+        if row is None or row["result_sha"] != confirmed_sha:
+            raise ValueError("job not found or checksum mismatch")
+        if row["state"] == "DONE":
+            c.commit()
+            return {"id": jid, "state": "DONE", "existing": True}
+        if row["state"] != "READY_FOR_DELIVERY":
+            raise ValueError("job not ready for delivery")
+        final = Path(row["result_path"])
+        if not final.is_file() or hash_file(final) != confirmed_sha:
+            raise ValueError("optimized output missing or hash mismatch")
+        # Only a trusted backend with a durable-storage ACK should call this.
+        c.execute("UPDATE jobs SET state='DONE',updated=? WHERE id=?",
+                  (int(time.time()), jid))
+        c.commit()
+        source_deleted = True
+        for path in (Path(row["input_path"]), final):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                source_deleted = False
+        if source_deleted:
+            c.execute("UPDATE jobs SET source_deleted=1,updated=? WHERE id=?",
+                      (int(time.time()), jid))
+            c.commit()
+        return {"id": jid, "state": "DONE", "temporary_files_deleted": source_deleted}
+    except BaseException:
+        c.rollback()
+        raise
     finally:
         c.close()
 
@@ -276,6 +310,10 @@ def main():
     z = sub.add_parser("retry")
     z.add_argument("tenant")
     z.add_argument("job_id")
+    ack = sub.add_parser("ack-delivery")
+    ack.add_argument("tenant")
+    ack.add_argument("job_id")
+    ack.add_argument("confirmed_sha256")
     sub.add_parser("run-once")
     args = a.parse_args()
     try:
@@ -285,6 +323,8 @@ def main():
             reply = status(args.tenant, args.job_id)
         elif args.action == "retry":
             reply = retry(args.tenant, args.job_id)
+        elif args.action == "ack-delivery":
+            reply = acknowledge(args.tenant, args.job_id, args.confirmed_sha256)
         else:
             import fcntl
             with (ROOT / ".worker.lock").open("a+") as lock:
