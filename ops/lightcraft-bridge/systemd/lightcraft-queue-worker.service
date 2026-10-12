@@ -1,0 +1,25 @@
+[Unit]
+Description=LightCraft isolated image queue worker
+Documentation=file:/opt/lightcraft/RESULTS.md
+Requires=docker.service
+After=docker.service
+ConditionPathExists=/opt/lightcraft/bridge/worker.py
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/lightcraft/bridge
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/lightcraft/bridge/worker.py run-once
+TimeoutStartSec=180
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/lightcraft/bridge
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
